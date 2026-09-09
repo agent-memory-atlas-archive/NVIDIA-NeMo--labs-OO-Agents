@@ -25,7 +25,7 @@ from collections.abc import Callable
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, TypeGuard
 
-from nooa._llm_state import StateCarryingMessage
+from nooa._llm_state import StateCarryingMessage, carry_replay_batch
 
 if TYPE_CHECKING:
     from nooa.config.truncation_config import FormatConfig
@@ -703,7 +703,7 @@ class ResponsesProviderFormatter(ProviderFormatter):
                         }
                     )
                 if msg.llm_state:
-                    out.append(_with_llm_state({"_batch": batch}, msg.llm_state))
+                    out.extend(carry_replay_batch(batch, msg.llm_state))
                 else:
                     out.extend(batch)
             elif msg.tool_call_id is not None:
@@ -750,7 +750,7 @@ class ResponsesProviderFormatter(ProviderFormatter):
                 role = msg.role if msg.role in (Role.USER, Role.ASSISTANT) else Role.USER
                 message = {"role": role.value, "content": msg.content or ""}
                 if msg.llm_state and role == Role.ASSISTANT:
-                    out.append(_with_llm_state({"_batch": [message]}, msg.llm_state))
+                    out.extend(carry_replay_batch([message], msg.llm_state))
                 else:
                     out.append(message)
         return out
