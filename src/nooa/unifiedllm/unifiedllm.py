@@ -1863,9 +1863,7 @@ class CompletionClient(UnifiedLLM):
             else cache_control_injection_points
         )
         prepared_messages = self._inject_cache_control(messages, cache_points)
-        prepared_messages, _, _ = self._prepare_cache_boundary(
-            prepared_messages, responses=False
-        )
+        prepared_messages, _, _ = self._prepare_cache_boundary(prepared_messages, responses=False)
 
         api_params = {
             "model": self.model,
@@ -2038,9 +2036,7 @@ class CompletionClient(UnifiedLLM):
             else cache_control_injection_points
         )
         prepared_messages = self._inject_cache_control(messages, cache_points)
-        prepared_messages, _, _ = self._prepare_cache_boundary(
-            prepared_messages, responses=False
-        )
+        prepared_messages, _, _ = self._prepare_cache_boundary(prepared_messages, responses=False)
 
         api_params = {
             "model": self.model,
