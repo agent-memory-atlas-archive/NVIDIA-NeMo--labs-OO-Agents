@@ -273,9 +273,8 @@ class TestXMLBlockFormatter:
         "response",
         [
             LLMResponse(content="", reasoning="private thought"),
-            LLMResponse(content="", llm_state={"opaque": "state"}),
         ],
-        ids=["reasoning-only", "state-only"],
+        ids=["reasoning-only"],
     )
     def test_unprojected_response_fields_do_not_create_empty_assistant_messages(self, response):
         messages = XMLBlockFormatter().format(
@@ -301,7 +300,9 @@ class TestXMLBlockFormatter:
             [ResolvedBlock(key="turn", content="", role=Role.ASSISTANT, event=response)]
         )
 
-        assert all(message.role is not Role.ASSISTANT for message in messages)
+        carrier = next(message for message in messages if message.role is Role.ASSISTANT)
+        assert carrier.content is None
+        assert carrier.llm_state == {"opaque": "state"}
 
     def test_linked_execution_falls_back_to_standalone_when_carrier_is_rejected(self):
         turn = LLMResponse(
