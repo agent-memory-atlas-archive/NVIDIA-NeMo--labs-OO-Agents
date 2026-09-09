@@ -52,7 +52,7 @@ def carry_replay_batch(
     batch_id = uuid4().hex
     size = len(messages)
     return [
-        StateCarryingMessage(
+        ReplayCarryingMessage(
             message,
             llm_state if index == 0 else None,
             reasoning if index == 0 else None,
