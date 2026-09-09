@@ -19,6 +19,8 @@ from pydantic import BaseModel, RootModel
 
 from nooa._llm_state import (
     LLM_STATE_KEY,
+    ReplayCarryingMessage,
+    carried_cache_boundary,
     carried_reasoning,
     carried_replay_batch,
     carried_state,
@@ -1132,13 +1134,65 @@ def _update_token_calibration(
         logger.debug("token calibration skipped (estimate failed)", exc_info=True)
 
 
+def _mark_responses_text(content: Any) -> tuple[Any, bool]:
+    """Attach an OpenAI explicit breakpoint to the last input-text block."""
+    marker = {"mode": "explicit"}
+    if isinstance(content, str):
+        return [
+            {
+                "type": "input_text",
+                "text": content,
+                "prompt_cache_breakpoint": marker,
+            }
+        ], True
+    if isinstance(content, list):
+        updated = copy.deepcopy(content)
+        for block in reversed(updated):
+            if isinstance(block, dict) and block.get("type") == "input_text":
+                block["prompt_cache_breakpoint"] = marker
+                return updated, True
+    return content, False
+
+
+def _mark_responses_cache_breakpoint(messages: list[dict[str, Any]], boundary: int) -> bool:
+    """Mark the latest eligible Responses input block before ``boundary``."""
+    for item in reversed(messages[:boundary]):
+        if item.get("type") == "function_call_output":
+            output, marked = _mark_responses_text(item.get("output"))
+            if marked:
+                item["output"] = output
+                return True
+        # Assistant output uses output_text, which is not an eligible input block.
+        if item.get("role") in {"system", "developer", "user"}:
+            content, marked = _mark_responses_text(item.get("content"))
+            if marked:
+                item["content"] = content
+                return True
+    return False
+
+
+def _enable_openai_explicit_cache(api_params: dict[str, Any]) -> None:
+    """Set the Responses cache mode through LiteLLM's SDK escape hatch."""
+    extra_body = copy.deepcopy(api_params.get("extra_body"))
+    if not isinstance(extra_body, dict):
+        extra_body = {}
+    options = extra_body.get("prompt_cache_options")
+    if not isinstance(options, dict):
+        options = {}
+    options["mode"] = "explicit"
+    extra_body["prompt_cache_options"] = options
+    api_params["extra_body"] = extra_body
+
+
 class UnifiedLLM(ABC):
     _registry_config: dict[str, Any] | None
+    cache_breakpoint: Literal["openai", "anthropic"] | None
 
     def __init__(self, model: str, **config):
         self.model = model
         self.config = config
         self._registry_config = None
+        self.cache_breakpoint = None
         # Cache control injection — shared by CompletionClient and ResponsesClient
         self.cache_control_injection_points: list[dict[str, Any]] = (
             DEFAULT_CACHE_CONTROL_INJECTION_POINTS
@@ -1277,6 +1331,52 @@ class UnifiedLLM(ABC):
                     break
 
         return messages
+
+    def _prepare_cache_boundary(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        responses: bool,
+        instructions: str | None = None,
+    ) -> tuple[list[dict[str, Any]], str | None, bool]:
+        """Consume the neutral stable-prefix marker at the provider edge."""
+        boundary: int | None = None
+        clean: list[dict[str, Any]] = []
+        for message in messages:
+            if carried_cache_boundary(message) and boundary is None:
+                boundary = len(clean)
+            item = copy.deepcopy(dict(message))
+            if item:
+                clean.append(item)
+
+        if boundary is None or self.cache_breakpoint is None:
+            return clean, instructions, False
+        if self.cache_breakpoint == "anthropic":
+            if boundary:
+                self._inject_cache_control_on_content(clean[boundary - 1])
+            return clean, instructions, False
+        if not responses:
+            return clean, instructions, False
+
+        marked = _mark_responses_cache_breakpoint(clean, boundary)
+        if not marked and instructions:
+            clean.insert(
+                0,
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": instructions,
+                            "prompt_cache_breakpoint": {"mode": "explicit"},
+                        }
+                    ],
+                },
+            )
+            instructions = None
+        # Explicit mode without a marker intentionally disables implicit writes
+        # through a volatile suffix when no stable input block is eligible.
+        return clean, instructions, True
 
     def count_tokens(self, text: str) -> int:
         """Count tokens using model-appropriate tokenizer.
@@ -1680,6 +1780,7 @@ class CompletionClient(UnifiedLLM):
         http_config: HttpConfig | None = None,
         # use system as default for cache_control_injection_points
         cache_control_injection_points: list[dict[str, Any]] | None = None,
+        cache_breakpoint: Literal["anthropic"] | None = None,
         replay_scope: str | None = None,
         **config,
     ):
@@ -1705,12 +1806,17 @@ class CompletionClient(UnifiedLLM):
                 enable prompt caching (for example: {"role": "system"} or
                 {"role": "tool", "position": "last"}). Applied to all calls.
                 Note: Do NOT manually add cache_control to message content when using this.
+            cache_breakpoint: Set to ``"anthropic"`` to map the cached
+                renderer's stable-prefix boundary to native ``cache_control``.
             replay_scope: Optional compatibility name for verified model aliases.
                 Provider, endpoint, credential/account, and API style must still match.
             **config: Additional configuration passed to litellm (api_key, api_base, etc.)
         """
+        if cache_breakpoint not in {None, "anthropic"}:
+            raise ValueError("CompletionClient supports only the 'anthropic' cache mapping")
         super().__init__(model, **config)
         self.retry_config = retry_config or RetryConfig()
+        self.cache_breakpoint = cache_breakpoint
         self._replay_scope = replay_scope
         self._http_config = http_config or HttpConfig()
         self._http = _ClientHttp.for_completion(self.model, self.config, self._http_config)
@@ -1757,6 +1863,9 @@ class CompletionClient(UnifiedLLM):
             else cache_control_injection_points
         )
         prepared_messages = self._inject_cache_control(messages, cache_points)
+        prepared_messages, _, _ = self._prepare_cache_boundary(
+            prepared_messages, responses=False
+        )
 
         api_params = {
             "model": self.model,
@@ -1929,6 +2038,9 @@ class CompletionClient(UnifiedLLM):
             else cache_control_injection_points
         )
         prepared_messages = self._inject_cache_control(messages, cache_points)
+        prepared_messages, _, _ = self._prepare_cache_boundary(
+            prepared_messages, responses=False
+        )
 
         api_params = {
             "model": self.model,
@@ -2173,6 +2285,7 @@ class ResponsesClient(UnifiedLLM):
         retry_config: RetryConfig | None = None,
         http_config: HttpConfig | None = None,
         cache_control_injection_points: list[dict[str, Any]] | None = None,
+        cache_breakpoint: Literal["openai"] | None = None,
         replay_scope: str | None = None,
         **config,
     ):
@@ -2199,12 +2312,17 @@ class ResponsesClient(UnifiedLLM):
             cache_control_injection_points: Optional list of role/position rules to
                 enable prompt caching (for example: {"role": "system"} or
                 {"role": "tool", "position": "last"}). Applied to all calls.
+            cache_breakpoint: Set to ``"openai"`` to map the cached renderer's
+                stable-prefix boundary to a Responses explicit breakpoint.
             replay_scope: Optional compatibility name for verified model aliases.
                 Provider, endpoint, credential/account, and API style must still match.
             **config: Additional configuration passed to litellm (api_key, api_base, etc.)
         """
+        if cache_breakpoint not in {None, "openai"}:
+            raise ValueError("ResponsesClient supports only the 'openai' cache mapping")
         super().__init__(model, **config)
         self.retry_config = retry_config or RetryConfig()
+        self.cache_breakpoint = cache_breakpoint
         self._replay_scope = replay_scope
         self._http_config = http_config or HttpConfig()
         self._http = _ClientHttp.for_responses(self.model, self.config, self._http_config)
@@ -2276,6 +2394,9 @@ class ResponsesClient(UnifiedLLM):
         else:
             prepared_messages = messages
         input_messages, instructions = self._transform_messages(prepared_messages, state_scope)
+        input_messages, instructions, openai_explicit = self._prepare_cache_boundary(
+            input_messages, responses=True, instructions=instructions
+        )
 
         api_params = {
             "model": self.model,
@@ -2284,6 +2405,8 @@ class ResponsesClient(UnifiedLLM):
             **self.config,
             **kwargs,
         }
+        if openai_explicit:
+            _enable_openai_explicit_cache(api_params)
 
         if instructions:
             api_params["instructions"] = instructions
@@ -2409,6 +2532,9 @@ class ResponsesClient(UnifiedLLM):
         else:
             prepared_messages = messages
         input_messages, instructions = self._transform_messages(prepared_messages, state_scope)
+        input_messages, instructions, openai_explicit = self._prepare_cache_boundary(
+            input_messages, responses=True, instructions=instructions
+        )
 
         api_params = {
             "model": self.model,
@@ -2417,6 +2543,8 @@ class ResponsesClient(UnifiedLLM):
             **self.config,
             **kwargs,
         }
+        if openai_explicit:
+            _enable_openai_explicit_cache(api_params)
 
         if instructions:
             api_params["instructions"] = instructions
@@ -2537,6 +2665,10 @@ class ResponsesClient(UnifiedLLM):
             if skip_batch_items:
                 skip_batch_items -= 1
                 continue
+            if carried_cache_boundary(original):
+                # Keep the boundary anchored before this logical message even
+                # when replay expands its carrier into several Responses items.
+                transformed.append(ReplayCarryingMessage({}, cache_boundary_before=True))
             state = copy.deepcopy(carried_state(original))
             reasoning = carried_reasoning(original)
             msg = copy.deepcopy(dict(original))

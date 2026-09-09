@@ -42,6 +42,7 @@ YAML schema::
         include:                             # optional Responses API output fields
           - reasoning.encrypted_content
         replay_scope: my-upstream-group      # optional verified replay compatibility override
+        cache_breakpoint: openai             # optional: openai or anthropic wire mapping
 
 Set a model to ``null`` in a later layer to remove it.
 """
@@ -392,6 +393,7 @@ def get_llm_client(name: str, *, client_type: str | None = None, **overrides) ->
         "store",
         "include",
         "replay_scope",
+        "cache_breakpoint",
     ):
         if key in config and key not in overrides:
             params[key] = config[key]

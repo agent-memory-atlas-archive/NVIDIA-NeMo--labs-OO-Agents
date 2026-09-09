@@ -21,6 +21,8 @@ import litellm
 
 from nooa._llm_state import (
     LLM_STATE_KEY,
+    ReplayCarryingMessage,
+    carried_cache_boundary,
     carried_reasoning,
     carried_state,
 )
@@ -460,6 +462,7 @@ def prepare_chat_messages(messages: list[dict[str, Any]], scope: str | None) -> 
     """Strip private/raw state and restore only a matching Chat payload."""
     prepared: list[dict[str, Any]] = []
     for original in messages:
+        cache_boundary = carried_cache_boundary(original)
         state = copy.deepcopy(carried_state(original))
         reasoning = carried_reasoning(original)
         message = copy.deepcopy(dict(original))
@@ -483,7 +486,11 @@ def prepare_chat_messages(messages: list[dict[str, Any]], scope: str | None) -> 
             and not message.get("tool_calls")
         ):
             continue
-        prepared.append(message)
+        prepared.append(
+            ReplayCarryingMessage(message, cache_boundary_before=True)
+            if cache_boundary
+            else message
+        )
     return prepared
 
 
