@@ -25,7 +25,7 @@ from collections.abc import Callable
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, TypeGuard
 
-from nooa._llm_state import StateCarryingMessage, carry_replay_batch
+from nooa._llm_state import ReplayCarryingMessage, carry_replay_batch
 
 if TYPE_CHECKING:
     from nooa.config.truncation_config import FormatConfig
@@ -260,15 +260,15 @@ def _event_block_to_messages(
     from nooa.context_blocks.models import BlockPart
 
     if _is_llm_response(block.event) and not _is_replayable_tool_call_turn(block.event):
-        # Opaque state gets an internal carrier even when the public turn has no
-        # text. UnifiedLLM removes that carrier on mismatch and is the only
-        # layer allowed to restore the provider payload.
-        if block.event.llm_state:
+        # Replay metadata gets an internal carrier even when the public turn has
+        # no text. UnifiedLLM alone restores opaque state or demotes reasoning.
+        if block.event.llm_state or block.event.reasoning:
             return [
                 RenderedMessage(
                     role=Role.ASSISTANT,
                     content=block.event.replay_content or None,
                     llm_state=block.event.llm_state,
+                    reasoning=block.event.reasoning,
                 )
             ]
         if not block.event.replay_content:
@@ -357,6 +357,7 @@ def _event_blocks_to_messages(
                         for call in event.tool_calls
                     ),
                     llm_state=event.llm_state,
+                    reasoning=event.reasoning,
                 )
             )
             for call in event.tool_calls:
@@ -552,9 +553,13 @@ def _arguments_object(arguments: dict[str, Any] | str) -> dict[str, Any]:
     return parsed
 
 
-def _with_llm_state(message: dict[str, Any], state: dict[str, Any] | None) -> dict[str, Any]:
-    """Carry opaque state outside the JSON-serializable message mapping."""
-    return StateCarryingMessage(message, state) if state else message
+def _with_replay_data(
+    message: dict[str, Any],
+    state: dict[str, Any] | None,
+    reasoning: str | None,
+) -> dict[str, Any]:
+    """Carry replay metadata outside the JSON-serializable message mapping."""
+    return ReplayCarryingMessage(message, state, reasoning) if state or reasoning else message
 
 
 class OpenAIProviderFormatter(ProviderFormatter):
@@ -579,7 +584,7 @@ class OpenAIProviderFormatter(ProviderFormatter):
                         for call in msg.tool_calls
                     ],
                 }
-                out.append(_with_llm_state(assistant_message, msg.llm_state))
+                out.append(_with_replay_data(assistant_message, msg.llm_state, msg.reasoning))
             elif msg.tool_call_id is not None:
                 out.append(
                     {
@@ -594,9 +599,10 @@ class OpenAIProviderFormatter(ProviderFormatter):
                 if msg.role in (Role.RUNTIME_EVENT, Role.METADATA):
                     continue
                 out.append(
-                    _with_llm_state(
+                    _with_replay_data(
                         {"role": msg.role.value, "content": msg.content or ""},
                         msg.llm_state,
+                        msg.reasoning,
                     )
                 )
         return out
@@ -628,12 +634,13 @@ class AnthropicProviderFormatter(ProviderFormatter):
                     for call in msg.tool_calls
                 )
                 out.append(
-                    _with_llm_state(
+                    _with_replay_data(
                         {
                             "role": "assistant",
                             "content": content,
                         },
                         msg.llm_state,
+                        msg.reasoning,
                     )
                 )
             elif msg.tool_call_id is not None:
@@ -660,9 +667,10 @@ class AnthropicProviderFormatter(ProviderFormatter):
                     continue
                 role = msg.role if msg.role in (Role.USER, Role.ASSISTANT) else Role.USER
                 out.append(
-                    _with_llm_state(
+                    _with_replay_data(
                         {"role": role.value, "content": msg.content or ""},
                         msg.llm_state,
+                        msg.reasoning,
                     )
                 )
 
@@ -702,8 +710,8 @@ class ResponsesProviderFormatter(ProviderFormatter):
                             "arguments": _arguments_json(call.arguments),
                         }
                     )
-                if msg.llm_state:
-                    out.extend(carry_replay_batch(batch, msg.llm_state))
+                if msg.llm_state or msg.reasoning:
+                    out.extend(carry_replay_batch(batch, msg.llm_state, msg.reasoning))
                 else:
                     out.extend(batch)
             elif msg.tool_call_id is not None:
@@ -749,8 +757,8 @@ class ResponsesProviderFormatter(ProviderFormatter):
                     continue
                 role = msg.role if msg.role in (Role.USER, Role.ASSISTANT) else Role.USER
                 message = {"role": role.value, "content": msg.content or ""}
-                if msg.llm_state and role == Role.ASSISTANT:
-                    out.extend(carry_replay_batch([message], msg.llm_state))
+                if (msg.llm_state or msg.reasoning) and role == Role.ASSISTANT:
+                    out.extend(carry_replay_batch([message], msg.llm_state, msg.reasoning))
                 else:
                     out.append(message)
         return out

@@ -11,26 +11,28 @@ from uuid import uuid4
 LLM_STATE_KEY = "_nooa_llm_state"
 
 
-class StateCarryingMessage(dict[str, Any]):
-    """A public wire message with provider state outside its mapping.
+class ReplayCarryingMessage(dict[str, Any]):
+    """A public wire message with replay metadata outside its mapping.
 
     Generic JSON serializers see only the ordinary dictionary fields. Built-in
-    UnifiedLLM clients read ``llm_state`` and apply their issuer gate before the
-    request reaches a provider.
+    UnifiedLLM clients read the attributes, gate opaque state by issuer, and
+    demote plain reasoning when exact replay is unavailable.
     """
 
-    __slots__ = ("llm_state", "replay_batch_id", "replay_batch_size")
+    __slots__ = ("llm_state", "reasoning", "replay_batch_id", "replay_batch_size")
 
     def __init__(
         self,
         message: dict[str, Any],
         llm_state: dict[str, Any] | None = None,
+        reasoning: str | None = None,
         *,
         replay_batch_id: str | None = None,
         replay_batch_size: int = 0,
     ):
         super().__init__(message)
         self.llm_state = copy.deepcopy(llm_state)
+        self.reasoning = reasoning
         self.replay_batch_id = replay_batch_id
         self.replay_batch_size = replay_batch_size
 
@@ -42,7 +44,9 @@ def carried_state(message: Any) -> dict[str, Any] | None:
 
 
 def carry_replay_batch(
-    messages: list[dict[str, Any]], llm_state: dict[str, Any]
+    messages: list[dict[str, Any]],
+    llm_state: dict[str, Any] | None,
+    reasoning: str | None,
 ) -> list[dict[str, Any]]:
     """Attach one replay envelope to a valid, JSON-safe Responses item batch."""
     batch_id = uuid4().hex
@@ -51,6 +55,7 @@ def carry_replay_batch(
         StateCarryingMessage(
             message,
             llm_state if index == 0 else None,
+            reasoning if index == 0 else None,
             replay_batch_id=batch_id,
             replay_batch_size=size,
         )
@@ -65,3 +70,9 @@ def carried_replay_batch(message: Any) -> tuple[str, int] | None:
     if isinstance(batch_id, str) and isinstance(batch_size, int) and batch_size > 0:
         return batch_id, batch_size
     return None
+
+
+def carried_reasoning(message: Any) -> str | None:
+    """Read provider-exposed text reasoning from a rendered message."""
+    reasoning = getattr(message, "reasoning", None)
+    return reasoning if isinstance(reasoning, str) and reasoning else None

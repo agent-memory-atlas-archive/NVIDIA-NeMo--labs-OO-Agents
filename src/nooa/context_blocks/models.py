@@ -305,6 +305,11 @@ class RenderedMessage(BaseModel):
         repr=False,
         description="Opaque state carried only to the UnifiedLLM replay gate",
     )
+    reasoning: str | None = Field(
+        default=None,
+        repr=False,
+        description="Plain reasoning carried to UnifiedLLM for compatible replay or demotion",
+    )
     tool_call_id: str | None = Field(
         default=None, description="Tool-call id this message is a result for"
     )
